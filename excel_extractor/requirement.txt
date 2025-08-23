@@ -1,5 +1,6 @@
 azure-functions
 azure-storage-blob
+pyexcel
+pyexcel-xls
+pyexcel-xlsx
 pandas
-openpyxl
-xlrd==1.2.0
