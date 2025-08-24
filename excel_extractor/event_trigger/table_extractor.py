@@ -3,8 +3,10 @@ import pandas as pd
 import numpy as np
 from pyexcel import get_sheet
 import csv
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import io
+import logging
+import re
 
 class ExcelTableExtractor:
     def __init__(self, value_threshold: float = 0.8, empty_threshold: float = 0.3):
@@ -17,6 +19,15 @@ class ExcelTableExtractor:
         """
         self.value_threshold = value_threshold
         self.empty_threshold = empty_threshold
+        
+        # Mapping of sheet names to CSV file suffixes
+        self.sheet_name_mapping = {
+            'CLAIM ANALYSIS BY COVERAGE': '-CLAIM_ANALYSIS',
+            'AGGREGATE ANALYSIS REPORT': '-AGGREGATE_ANALYSIS',
+            'LARGE CLAIM': '-LARGE_CLAIM',
+            'SPECIFIC ANALYSIS': '-SPECIFIC_ANALYSIS',
+            'COVERED PARTICIPANTS LISTING': '-COVERED_PARTICIPANTS_LISTING'
+        }
     
     def extract_group_id(self, blob_name: str) -> str:
         """
@@ -40,6 +51,88 @@ class ExcelTableExtractor:
         except Exception as e:
             print(f"Error extracting group_id: {e}")
             return ""
+    
+    def get_csv_suffix(self, sheet_name: str) -> str:
+        """
+        Get the CSV file suffix based on sheet name mapping
+        
+        Args:
+            sheet_name: The name of the worksheet
+            
+        Returns:
+            CSV file suffix or empty string if no mapping found
+        """
+        # Check for exact match first
+        if sheet_name in self.sheet_name_mapping:
+            return self.sheet_name_mapping[sheet_name]
+        
+        # Check for case-insensitive match
+        sheet_name_upper = sheet_name.upper()
+        for key, suffix in self.sheet_name_mapping.items():
+            if key.upper() == sheet_name_upper:
+                return suffix
+        
+        # Return default suffix if no mapping found
+        safe_name = "".join(c if c.isalnum() else "_" for c in sheet_name)
+        return f"-{safe_name}"
+    
+    def normalize_column_name(self, column_name: str) -> str:
+        """
+        Convert column name to underscore-separated format
+        
+        Args:
+            column_name: Original column name
+            
+        Returns:
+            Normalized column name with underscores instead of spaces
+        """
+        if column_name is None:
+            return "UNNAMED_COLUMN"
+        
+        # Convert to string and strip whitespace
+        col_str = str(column_name).strip()
+        
+        # Replace spaces with underscores
+        col_str = col_str.replace(' ', '_')
+        
+        # Replace multiple underscores with single underscore
+        col_str = re.sub(r'_+', '_', col_str)
+        
+        # Remove special characters (keep alphanumeric and underscores)
+        col_str = re.sub(r'[^a-zA-Z0-9_]', '', col_str)
+        
+        # Ensure it's not empty
+        if not col_str:
+            return "UNNAMED_COLUMN"
+        
+        # Ensure it doesn't start or end with underscore
+        col_str = col_str.strip('_')
+        
+        return col_str if col_str else "UNNAMED_COLUMN"
+    
+    def normalize_column_names(self, table_data: List[List]) -> List[List]:
+        """
+        Normalize all column names in the table data
+        
+        Args:
+            table_data: The table data with header row
+            
+        Returns:
+            Table data with normalized column names
+        """
+        if not table_data:
+            return table_data
+        
+        # Check if first row contains column headers (has non-empty values)
+        header_row = table_data[0]
+        has_headers = any(cell is not None and str(cell).strip() != '' for cell in header_row)
+        
+        if has_headers:
+            # Normalize each column name in the header row
+            normalized_headers = [self.normalize_column_name(cell) for cell in header_row]
+            table_data[0] = normalized_headers
+        
+        return table_data
     
     def read_excel_sheet(self, file_content: bytes, sheet_name: str, file_extension: str) -> List[List]:
         """
@@ -89,19 +182,30 @@ class ExcelTableExtractor:
         if header_row is None:
             return None
         
-        # Find the end of the table (first row after header with <30% cells having values)
+        # Find the end of the table (first row after header with <30% cells having values OR contains total keyword)
         table_end = None
+        total_keywords = {'total', 'summary', 'subtotal', 'grand total', 'final'}
+        
         for i in range(header_row + 1, rows):
             row = data[i]
             if len(row) < cols:
                 row = row + [None] * (cols - len(row))
             
             non_empty_count = sum(1 for cell in row if cell is not None and str(cell).strip() != '')
-            if non_empty_count / cols < self.empty_threshold:
+            
+            # Check if row meets empty threshold OR contains total-related keywords in any cell
+            has_total_keyword = any(
+                cell is not None and 
+                isinstance(cell, str) and 
+                any(keyword in str(cell).lower() for keyword in total_keywords)
+                for cell in row
+            )
+            
+            if non_empty_count / cols < self.empty_threshold or has_total_keyword:
                 table_end = i - 1
                 break
         
-        # If no empty row found, table goes to the end
+        # If no empty row or total row found, table goes to the end
         if table_end is None:
             table_end = rows - 1
         
@@ -173,7 +277,7 @@ class ExcelTableExtractor:
         
         # Add Group column header if we have a header row
         if table_data and any(cell is not None and str(cell).strip() != '' for cell in table_data[0]):
-            # Add "Group" to the header row
+            # Add "Group" to the header row (normalized)
             table_data[0].append("Group")
         else:
             # If no header row, create one
@@ -197,7 +301,7 @@ class ExcelTableExtractor:
         writer.writerows(data)
         return output.getvalue().encode('utf-8')
     
-    def process_excel_content(self, file_content: bytes, file_extension: str, blob_name: str) -> dict:
+    def process_excel_content(self, file_content: bytes, file_extension: str, blob_name: str) -> Dict[str, bytes]:
         """
         Process Excel file content and extract tables from all sheets
         
@@ -207,7 +311,7 @@ class ExcelTableExtractor:
             blob_name: Name of the blob file for group_id extraction
             
         Returns:
-            Dictionary with sheet names as keys and CSV content as bytes values
+            Dictionary with sheet names as keys and tuple of (csv_content, csv_suffix) as values
         """
         result = {}
         
@@ -229,6 +333,11 @@ class ExcelTableExtractor:
         
         for sheet_name in sheet_names:
             print(f"Processing sheet: {sheet_name}")
+            
+            # Skip 'summary' sheets (case-insensitive)
+            if sheet_name.upper() == 'SUMMARY':
+                print(f"Skipping summary sheet: {sheet_name}")
+                continue
             
             # Read sheet data
             sheet_data = self.read_excel_sheet(file_content, sheet_name, file_extension)
@@ -254,10 +363,22 @@ class ExcelTableExtractor:
             # Add Group column with group_id
             table_data_with_group = self.add_group_column(table_data, group_id)
             
-            # Convert to CSV
-            csv_bytes = self.table_to_csv_bytes(table_data_with_group)
-            result[sheet_name] = csv_bytes
+            # Normalize column names (replace spaces with underscores)
+            table_data_normalized = self.normalize_column_names(table_data_with_group)
             
-            print(f"Extracted table with {len(table_data_with_group)} rows and {len(table_data_with_group[0]) if table_data_with_group else 0} columns")
+            # Convert to CSV
+            csv_bytes = self.table_to_csv_bytes(table_data_normalized)
+            
+            # Get CSV suffix based on sheet name
+            csv_suffix = self.get_csv_suffix(sheet_name)
+            
+            # Store both CSV content and suffix
+            result[sheet_name] = {
+                'csv_content': csv_bytes,
+                'csv_suffix': csv_suffix
+            }
+            
+            print(f"Extracted table with {len(table_data_normalized)} rows and {len(table_data_normalized[0]) if table_data_normalized else 0} columns")
+            print(f"CSV suffix for {sheet_name}: {csv_suffix}")
         
         return result
