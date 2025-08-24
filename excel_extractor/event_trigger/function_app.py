@@ -85,10 +85,13 @@ def ExcelTableExtractorFunction(event: func.EventGridEvent):
         # Upload each table as a CSV file
         base_name = os.path.splitext(os.path.basename(blob_name))[0]
         
-        for sheet_name, csv_content in tables.items():
+        for sheet_name, table_info in tables.items():
+            csv_content = table_info['csv_content']
+            csv_suffix = table_info['csv_suffix']
+            
             # Create safe filename
             safe_sheet_name = "".join(c if c.isalnum() else "_" for c in sheet_name)
-            output_blob_name = f"{base_name}_{safe_sheet_name}_table.csv"
+            output_blob_name = f"{base_name}{csv_suffix}.csv"
             
             # Upload CSV to output container
             output_blob_client = output_container_client.get_blob_client(output_blob_name)
